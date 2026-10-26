@@ -8,6 +8,7 @@
 // @version      3.4.0
 // @description  悬停推文即刻调用 X 官方 Grok AI 翻译，并支持可选「自动翻译」（滚动到哪译到哪）；色条引述 / 卡片 / 极简三档外观，译文·对照·原文丝滑切换，动效分「无 / 中等 / 全」三档，低配设备也流畅
 // @author       Noctyn
+// @license      MIT
 // @match        https://x.com/*
 // @match        https://twitter.com/*
 // @icon         https://x.com/favicon.ico
