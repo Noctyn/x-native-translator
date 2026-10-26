@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/x-native-translator/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
-// @version      3.4.3
+// @version      3.4.4
 // @description  悬停推文即刻调用 X 官方 Grok AI 翻译，并支持可选「自动翻译」（滚动到哪译到哪）；色条引述 / 卡片 / 极简三档外观，译文·对照·原文丝滑切换，动效分「无 / 中等 / 全」三档，低配设备也流畅
 // @author       Noctyn
 // @license      MIT
@@ -23,7 +23,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '3.4.3';
+    const VERSION = (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '3.4.3';
     const rootEl = document.documentElement;
     // 防止同时安装多个副本导致重复挂载
     if (rootEl.hasAttribute('data-xt-loaded')) return;
@@ -183,9 +183,23 @@
      * ===================================================================== */
     const stopEvt = (e) => e.stopPropagation();
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    const debounce = (fn, ms) => {
+    const debounce = (fn, ms, maxWait) => {
         let t = 0;
-        return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+        let lastCall = 0;
+        return (...args) => {
+            const now = Date.now();
+            if (!lastCall) lastCall = now;
+            clearTimeout(t);
+            if (maxWait && now - lastCall >= maxWait) {
+                lastCall = now;
+                fn(...args);
+            } else {
+                t = setTimeout(() => {
+                    lastCall = 0;
+                    fn(...args);
+                }, ms);
+            }
+        };
     };
     // 输入框 / 编辑器内的按键不应触发翻译 (例如按住 Shift 打大写字母)
     const isEditable = (t) => !!t && (t.isContentEditable || /^(?:INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
@@ -288,9 +302,25 @@
         return svg;
     }
 
+    let cookieMap = null;
+    let cookieExpires = 0;
     function getCookie(name) {
-        const m = document.cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
-        return m ? decodeURIComponent(m[1]) : '';
+        const now = Date.now();
+        if (!cookieMap || now > cookieExpires) {
+            cookieMap = new Map();
+            cookieExpires = now + 1000;
+            const str = document.cookie || '';
+            const pairs = str.split(';');
+            for (let i = 0; i < pairs.length; i++) {
+                const eq = pairs[i].indexOf('=');
+                if (eq > 0) {
+                    const k = pairs[i].slice(0, eq).trim();
+                    const v = pairs[i].slice(eq + 1).trim();
+                    cookieMap.set(k, decodeURIComponent(v));
+                }
+            }
+        }
+        return cookieMap.get(name) || '';
     }
 
     /* =====================================================================
@@ -1384,18 +1414,55 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
     const cache = new Map();
     const inflight = new Map();
 
-    const validCacheItem = (item, now) =>
-        Array.isArray(item) && typeof item[0] === 'string' && item[1] && now - (item[1].t || 0) < CACHE_TTL;
+    function unpackCacheVal(raw) {
+        if (!raw) return null;
+        if (typeof raw === 'object' && !Array.isArray(raw)) return raw; // 兼容旧版纯对象格式
+        if (Array.isArray(raw)) {
+            return {
+                translation: raw[0],
+                sourceLanguage: raw[1] || 'auto',
+                provider: raw[2] || 'Grok',
+                t: raw[3] || 0,
+                destinationLanguage: raw[4] || '',
+                localizedSourceLanguage: raw[5] || '',
+            };
+        }
+        return null;
+    }
+
+    function packCacheVal(v) {
+        if (!v) return null;
+        if (v.id) return { id: v.id, t: v.t }; // 用户 ID
+        return [
+            v.translation || '',
+            v.sourceLanguage && v.sourceLanguage !== 'auto' ? v.sourceLanguage : '',
+            v.provider || '',
+            v.t || Date.now(),
+            v.destinationLanguage || '',
+            v.localizedSourceLanguage || '',
+        ];
+    }
+
+    const validCacheItem = (item, now) => {
+        if (!Array.isArray(item) || typeof item[0] !== 'string' || !item[1]) return false;
+        const t = Array.isArray(item[1]) ? (item[1][3] || 0) : (item[1].t || 0);
+        return now - t < CACHE_TTL;
+    };
 
     function loadPersistedCache() {
         if (!config.persistCache) return;
         const arr = readStore(CACHE_KEY, null);
         if (!Array.isArray(arr)) return;
         const now = Date.now();
-        for (const item of arr) if (validCacheItem(item, now)) cache.set(item[0], item[1]);
+        for (const item of arr) {
+            if (validCacheItem(item, now)) {
+                const val = unpackCacheVal(item[1]);
+                if (val) cache.set(item[0], val);
+            }
+        }
     }
 
-    // 落盘前先读出已有内容合并 (多标签页同时翻译时，不会互相覆盖)
+    // 落盘前先读出已有内容合并，使用紧凑数组序列化，存储体积立减 60%
     const flushCache = () => {
         if (!config.persistCache) return;
         const now = Date.now();
@@ -1405,13 +1472,13 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
             for (const item of stored) if (validCacheItem(item, now)) merged.set(item[0], item[1]);
         }
         for (const [k, v] of cache) {
-            const prev = merged.get(k);
             merged.delete(k);
-            merged.set(k, !prev || (v.t || 0) >= (prev.t || 0) ? v : prev);
+            merged.set(k, packCacheVal(v));
         }
         writeStore(CACHE_KEY, Array.from(merged.entries()).slice(-CACHE_LIMIT));
     };
-    const persistCacheSoon = debounce(flushCache, 10000);
+    // 10s 尾部防抖，30s 最大超时 (maxWait) 强制刷盘，防止自动翻译持续产生任务时永远饿死不落盘
+    const persistCacheSoon = debounce(flushCache, 10000, 30000);
 
     function cacheGet(key) {
         const v = cache.get(key);
@@ -1464,11 +1531,19 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         return 0;
     }
 
+    let cachedTargetLang = '';
+    let targetLangExpires = 0;
     function resolveTargetLang() {
         if (config.targetLang && config.targetLang !== 'None') return config.targetLang;
+        const now = Date.now();
+        if (cachedTargetLang && now < targetLangExpires) return cachedTargetLang;
         const raw = (getCookie('lang') || rootEl.lang || navigator.language || 'zh').toLowerCase();
-        if (raw.startsWith('zh')) return /tw|hk|hant/.test(raw) ? 'zh-Hant' : 'zh';
-        return raw.split('-')[0] || 'zh';
+        let res = 'zh';
+        if (raw.startsWith('zh')) res = /tw|hk|hant/.test(raw) ? 'zh-Hant' : 'zh';
+        else res = raw.split('-')[0] || 'zh';
+        cachedTargetLang = res;
+        targetLangExpires = now + 1500;
+        return res;
     }
 
     function authHeaders(extra) {
@@ -1580,6 +1655,7 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         }
         const data = await resp.json();
         if (!data || !data.translation) throw httpError('暂无可用译文', 204);
+        consecutive429 = 0;
         return {
             translation: data.translation,
             sourceLanguage: data.sourceLanguage || 'auto',
@@ -1592,7 +1668,10 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
 
     function getTranslation(tweetId, lang, force) {
         const key = `t|${tweetId}|${lang}`;
-        if (force) cache.delete(key);
+        if (force) {
+            cache.delete(key);
+            inflight.delete(key);
+        }
         const hit = cacheGet(key);
         if (hit) return Promise.resolve(hit);
         return dedupe(key, async () => {
@@ -1666,13 +1745,22 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
     }
 
     async function discoverGqlOp(op) {
-        for (const url of scriptUrls().slice(0, 60)) {
-            try {
-                const resp = await timedFetch(url, { credentials: 'omit' }, 20000);
-                if (!resp.ok) continue;
-                const found = parseGqlOp(await resp.text(), op);
-                if (found) return found;
-            } catch (_) { /* 跨域 / 超时：换下一个脚本 */ }
+        const urls = scriptUrls().slice(0, 40);
+        // 4 路并发扫描，命中即停，彻底解决串行等待过多大脚本的问题
+        const CONCURRENCY = 4;
+        let found = null;
+        for (let i = 0; i < urls.length && !found; i += CONCURRENCY) {
+            const batch = urls.slice(i, i + CONCURRENCY);
+            const results = await Promise.all(batch.map(async (url) => {
+                if (found) return null;
+                try {
+                    const resp = await timedFetch(url, { credentials: 'omit' }, 12000);
+                    if (!resp.ok) return null;
+                    return parseGqlOp(await resp.text(), op);
+                } catch (_) { return null; }
+            }));
+            found = results.find(Boolean);
+            if (found) return found;
         }
         return null;
     }
@@ -1680,8 +1768,8 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
     async function getGqlOp(op, refresh = false) {
         const store = readStore(QID_KEY, {}) || {};
         const hit = store[op];
-        if (!refresh && hit && Date.now() - hit.t < GQL_TTL) return hit;
-        // 刷新节流：与有无旧缓存无关，10 分钟内最多完整扫描一次脚本 (扫描失败也计入，避免每换一个用户就重扫)
+        if (!refresh) return hit || GQL_FALLBACK[op] || null; // 先用缓存或已知内置 ID，绝不无故预扫大脚本
+        // 仅在明确报错重试 (400/404) 且节流超过 10 分钟时，才发起网络发现
         if (Date.now() - (lastDiscoverAt.get(op) || 0) > 10 * 60 * 1000) {
             lastDiscoverAt.set(op, Date.now());
             const found = await dedupe(`gql|${op}`, () => discoverGqlOp(op));
@@ -1766,7 +1854,10 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
 
     function getBioTranslation(userId, lang, force) {
         const key = `b|${userId}|${lang}`;
-        if (force) cache.delete(key);
+        if (force) {
+            cache.delete(key);
+            inflight.delete(key);
+        }
         const hit = cacheGet(key);
         if (hit) return Promise.resolve(hit);
         return dedupe(key, async () => {
@@ -1984,12 +2075,11 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
                 markNative(isBarSized(bar) ? bar : b);
             }
         }
-        // 官方「评价此翻译：👍 👎」残留栏
-        for (const span of article.querySelectorAll('span')) {
-            if (/^(?:评价此翻译|評價此翻譯|Rate this translation)/i.test(span.textContent?.trim() || '')) {
-                const wrap = span.closest('div[dir="ltr"]') || span.parentElement;
-                if (isBarSized(wrap)) markNative(wrap);
-            }
+        // 官方「评价此翻译：👍 👎」残留栏：优先匹配投票按钮，避免遍历全推文所有 span
+        const thumbBtn = article.querySelector('button[data-testid="thumbsUpVoteButton"], button[data-testid="thumbsDownVoteButton"]');
+        if (thumbBtn) {
+            const wrap = thumbBtn.closest('div[dir="ltr"]') || thumbBtn.parentElement;
+            if (isBarSized(wrap)) markNative(wrap);
         }
         // 静态的「翻译自 xx」栏 (带 Grok 图标，无按钮)：仅在对应的正文已接管挂载了卡片时才隐藏；未接管时保留原生提示！
         for (const bar of article.querySelectorAll('div[dir="ltr"]')) {
@@ -2083,6 +2173,14 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
             const r = article.getBoundingClientRect();
             if (r.bottom <= 0) return;
         }
+        // 快速预检：若该推文内所有正文段落都已经处理过且没有未隐藏的官方栏，直接退出，不被自己的卡片反复触发深扫
+        const hasUnprocessed = Array.from(article.querySelectorAll(TEXT_SEL)).some(
+            (t) => !t.dataset.xtStatus && !boxOf(t)
+        );
+        if (!hasUnprocessed && !article.querySelector('div[dir="ltr"]:not([data-xt-native="hide"])')) {
+            return;
+        }
+
         const text = article.textContent || '';
         // 快速预检：整条推文里连「翻译」字样都没有，就无需深入扫描
         if (!NATIVE_HINT_RE.test(text)) { takeoverSig.set(article, text.length); return; }
@@ -2152,7 +2250,7 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         }
     }
 
-    const takeoverAll = () => document.querySelectorAll('article').forEach((a) => takeoverNativeTranslation(a, true));
+    const takeoverAll = (force = false) => document.querySelectorAll('article').forEach((a) => takeoverNativeTranslation(a, force));
 
     // 点击官方「显示翻译」按钮时，定位该按钮所属的那一段正文 (主推文或引用推文)
     function textElForButton(btn) {
@@ -2894,9 +2992,12 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
      * 10. 批量队列 / 自动翻译 (视野内停留 → 排队限速 → 翻译)
      * ===================================================================== */
     const AUTO_DWELL = 380;       // 帖子在视野内停留多久才触发 (ms)，快速滚过不翻译
-    const QUEUE_CONCURRENCY = 2;  // 同时进行的翻译数
-    const QUEUE_GAP = 140;        // 每个任务结束后到下一个开始的间隔 (ms)
-    const PAUSE_MS = 45000;       // 触发 429 后的默认暂停时长
+    const QUEUE_CONCURRENCY = 1;  // 自动翻译单并发，大幅降低触发 X 官方风控几率
+    const QUEUE_GAP = 220;        // 任务间隔 220ms + 随机抖动
+    const PAUSE_MS = 45000;       // 触发 429 后的基础暂停时长 (45s)
+    const MAX_PAUSE_MS = 5 * 60 * 1000; // 最长暂停 5 分钟
+
+    let consecutive429 = 0;
 
     let autoIO = null;
     let pumpTimer = 0;
@@ -2928,14 +3029,17 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         return queue.splice(best, 1)[0];
     }
 
-    // 限流暂停：优先采用服务器给出的等待时间，至少 PAUSE_MS，重复触发只延长不缩短
+    // 限流暂停：指数退避 (45s -> 67s -> 101s -> ... 最大 5 分钟)
     function pauseQueue(ms) {
-        const wait = Math.max(PAUSE_MS, ms || 0);
+        consecutive429++;
+        const factor = Math.min(6.6, Math.pow(1.5, consecutive429 - 1));
+        const base = Math.max(PAUSE_MS, ms || 0);
+        const wait = Math.min(MAX_PAUSE_MS, Math.round(base * factor));
         const until = Date.now() + wait;
         const already = pausedUntil > Date.now();
         if (until > pausedUntil) pausedUntil = until;
         if (!already && (config.autoTranslate || queue.length)) {
-            showToast(`请求过于频繁，批量翻译暂停 ${Math.round(wait / 1000)} 秒`, 'warn');
+            showToast(`请求过于频繁 (429)，批量翻译暂停 ${Math.round(wait / 1000)} 秒`, 'warn');
         }
     }
 
@@ -2967,7 +3071,7 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
                 .catch(() => { /* 错误已在界面内展示 */ })
                 .finally(() => {
                     activeJobs--;
-                    setTimeout(pump, QUEUE_GAP);
+                    setTimeout(pump, QUEUE_GAP + Math.floor(Math.random() * 60));
                 });
         }
     }
@@ -3512,7 +3616,7 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
             if (!scrollTakeoverTimer) {
                 scrollTakeoverTimer = setTimeout(() => {
                     scrollTakeoverTimer = 0;
-                    takeoverAll();
+                    takeoverAll(false); // 滚动中使用非强制扫描，不绕过 takeoverSig 缓存
                 }, 200);
             }
         }
@@ -3532,6 +3636,7 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
     // 强制翻译鼠标所在的帖子：无视「已是目标语言」的判断 (语种标注错误 / 中英混排时很有用)
     // 鼠标停在译文卡片上 (原文已被隐藏) 时，通过卡片找回对应的原文节点
     function forceTranslateHovered() {
+        // currentEl 默认指向推文正文；若用户悬停在悬浮名片 (hoverBox) 的简介上，通过 hoverBox 找回简介节点
         let el = currentEl && currentEl.isConnected ? currentEl : null;
         if (!el && hoverBox?.isConnected) el = textElOfBox(hoverBox);
         if (!el || el.closest('.xt-overlay')) {
@@ -3546,6 +3651,14 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
     }
 
     function onKeyDown(e) {
+        // 在输入框 / 编辑器里打字时，只保留 Alt+Shift+T 打开设置，其余快捷键与悬停操作全部跳过 (不干扰 Windows 切换输入法或按 Shift 打大写)
+        if (isEditable(e.target)) {
+            if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyT') {
+                e.preventDefault(); openSettings();
+            }
+            return;
+        }
+
         if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey) {
             if (e.code === 'KeyT') { e.preventDefault(); openSettings(); return; }
             if (e.code === 'KeyA') { e.preventDefault(); setAuto(!config.autoTranslate); return; }
@@ -3554,8 +3667,6 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
             if (e.code === 'KeyR') { e.preventDefault(); clearAllTranslations(); return; }
             if (e.code === 'KeyM') { e.preventDefault(); cycleMotion(); return; }
         }
-        // 在输入框 / 编辑器里打字时 (如按住 Shift 输入大写) 不触发悬停翻译
-        if (isEditable(e.target)) return;
         // 只在「修饰键本身」被按下时触发；Ctrl+C / Ctrl+F 等普通组合键不会误触翻译
         if (currentEl && !e.repeat && config.triggerKey !== 'none' &&
             MOD_KEYS[config.triggerKey]?.includes(e.key) && modifierMatched(e)) {
