@@ -6,7 +6,7 @@
 // @updateURL    https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
 // @version      3.4.4
-// @description  悬停推文即刻调用 X 官方 Grok AI 翻译，并支持可选「自动翻译」（滚动到哪译到哪）；色条引述 / 卡片 / 极简三档外观，译文·对照·原文丝滑切换，动效分「无 / 中等 / 全」三档，低配设备也流畅
+// @description  悬停推文即刻调用 X 官方 Grok AI 翻译，并支持可选「自动翻译」；默认双语对照、极简竖线、全动画，零第三方 API Key，超快极简顺滑
 // @author       Noctyn
 // @license      MIT
 // @match        https://x.com/*
@@ -49,23 +49,23 @@
     const MOTION_LEVELS = ['off', 'medium', 'full'];
 
     const DEFAULTS = Object.freeze({
-        style: 'quote',                // 'quote' 色条引述 | 'card' 轻盈卡片 | 'minimal' 极简竖线
-        mode: 'replace',               // 推文显示方式：'replace' 译文 | 'bilingual' 对照 | 'original' 原文
-        bioMode: 'replace',            // 主页简介显示
-        hoverCardMode: 'replace',      // 悬浮名片显示
+        style: 'minimal',              // 'quote' 色条引述 | 'card' 轻盈卡片 | 'minimal' 极简竖线
+        mode: 'bilingual',             // 推文显示方式：'replace' 译文 | 'bilingual' 对照 | 'original' 原文
+        bioMode: 'bilingual',          // 主页简介显示
+        hoverCardMode: 'bilingual',    // 悬浮名片显示
         delay: 200,                    // 悬停触发延迟 (ms)
         targetLang: 'None',            // 'None' = 跟随 X 界面语言
         triggerKey: 'none',            // 'none' 直接悬停 | 'alt' | 'ctrl' | 'shift'
         skipSame: true,                // 跳过已是目标语言的推文
         preferNative: true,            // 优先触发推特自带的「显示翻译」按钮 (接管开启时无效)
-        takeoverNative: true,          // 统一接管官方原生翻译样式（替换为增强卡片）
+        takeoverNative: false,         // 统一接管官方原生翻译样式 (实验性，默认关闭以保证极致顺滑)
         autoExpand: true,              // 手动翻译前自动展开长推文
         translateProfileBio: true,     // 自动翻译个人资料主页简介
         translateHoverCard: true,      // 自动翻译悬浮名片 (HoverCard) 弹窗
         autoTranslate: false,          // 自动翻译：滚动浏览时自动翻译视野内的帖子
         autoScope: 'all',              // 'all' 时间线与详情页 | 'detail' 仅帖子详情页
         persistCache: true,            // 持久化译文缓存，刷新页面后无需重新请求
-        motion: 'medium',              // 动效档位：'off' 无动画 | 'medium' 中等 | 'full' 全动画
+        motion: 'full',                // 动效档位：'off' 无动画 | 'medium' 中等 | 'full' 全动画
     });
     const BOOL_KEYS = [
         'skipSame', 'preferNative', 'takeoverNative', 'autoExpand', 'translateProfileBio',
@@ -3396,10 +3396,13 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
 
         const pBehave = [
             sec('翻译行为'),
-            row('统一接管官方原生翻译样式', '将推特简陋的原生翻译替换为本脚本增强卡片（支持双语对照、复制与三档外观）',
+            row('统一接管官方原生翻译样式 (实验性)', '⚠️ 开启后将接管推特「显示翻译」按钮。由于推特引用帖单向翻译无还原按钮，且多帖撑开高度可能对时间线虚拟列表滚动的平滑度产生轻微干扰，默认推荐关闭。',
                 sw('takeoverNative', '统一接管官方原生翻译样式', (v) => {
                     syncRootAttrs();
-                    if (v) takeoverAll();
+                    if (v) {
+                        showToast('已开启原生接管：多帖尺寸变化可能对时间线滚动平滑度产生轻微干扰', 'warn');
+                        takeoverAll();
+                    }
                 })),
             row('优先使用 X 原生翻译按钮', '帖子自带「显示翻译」按钮时直接触发（接管开启时无效）', sw('preferNative', '优先使用 X 原生翻译按钮'), 'prefer'),
             row('跳过已是目标语言的帖子', '自动识别中日韩与目标语种，避免重复翻译', sw('skipSame', '跳过已是目标语言的帖子')),
