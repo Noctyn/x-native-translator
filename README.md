@@ -6,7 +6,8 @@
 
 使用前需安装 [Tampermonkey](https://www.tampermonkey.net/) 或 Violentmonkey 扩展：
 
-👉 **[点击安装脚本](https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js)**
+- **[Greasy Fork 安装](https://greasyfork.org/zh-CN/scripts/602228)**（推荐）
+- **[GitHub 直接安装](https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js)**
 
 ## 主要功能
 
