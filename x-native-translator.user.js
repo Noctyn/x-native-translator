@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/x-native-translator/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
-// @version      3.4.2
+// @version      3.4.3
 // @description  悬停推文即刻调用 X 官方 Grok AI 翻译，并支持可选「自动翻译」（滚动到哪译到哪）；色条引述 / 卡片 / 极简三档外观，译文·对照·原文丝滑切换，动效分「无 / 中等 / 全」三档，低配设备也流畅
 // @author       Noctyn
 // @license      MIT
@@ -23,7 +23,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '3.4.2';
+    const VERSION = '3.4.3';
     const rootEl = document.documentElement;
     // 防止同时安装多个副本导致重复挂载
     if (rootEl.hasAttribute('data-xt-loaded')) return;
@@ -2070,12 +2070,18 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
     // 已扫描过的 article 及其文本长度签名：内容没变化就不重复深扫，时间线滚动更省电
     const takeoverSig = new WeakMap();
 
+    let navRestoring = false;
+    let navRestoreTimer = 0;
+
     function takeoverNativeTranslation(article, force = false) {
         if (!config.takeoverNative || !article?.isConnected) return;
-        // 时间线页面中，若推文完全在视口上方 (bottom < -50)，不主动触发耗时接管，避免撑开高度导致滚动跳动
-        if (!isDetailPage() && !force) {
+        // 返回时间线过渡期间 (500ms 内) 暂停处理，让推特原生滚动还原 100% 顺滑着陆
+        if (navRestoring && !force) return;
+        // 时间线页面中，若推文完全在视口上方 (bottom <= 0)，无论是否 force，绝对不主动接管撑高高度！
+        // 彻底杜绝视口上方任何推文被撑开高度导致滚动上下弹跳
+        if (!isDetailPage()) {
             const r = article.getBoundingClientRect();
-            if (r.bottom < -50) return;
+            if (r.bottom <= 0) return;
         }
         const text = article.textContent || '';
         // 快速预检：整条推文里连「翻译」字样都没有，就无需深入扫描
@@ -2968,6 +2974,7 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
 
     function enqueue(el, auto) {
         if (!el.isConnected || el.dataset.xtStatus || el.dataset.xtQueued) return;
+        if (auto && !inViewport(el)) return;
         el.dataset.xtQueued = '1';
         queue.push({ el, auto });
         pump();
@@ -2983,7 +2990,7 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
                 if (autoTimers.has(el) || el.dataset.xtStatus) continue;
                 autoTimers.set(el, setTimeout(() => {
                     autoTimers.delete(el);
-                    if (config.autoTranslate && autoAllowedHere()) enqueue(el, true);
+                    if (config.autoTranslate && autoAllowedHere() && inViewport(el)) enqueue(el, true);
                 }, AUTO_DWELL));
             } else if (autoTimers.has(el)) {
                 clearTimeout(autoTimers.get(el));
@@ -3589,6 +3596,7 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
 
     function flushMutations() {
         flushTimer = 0;
+        if (navRestoring) return;
         const nodes = Array.from(pendingNodes);
         pendingNodes.clear();
         const articles = new Set();
@@ -3661,59 +3669,19 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         document.addEventListener('visibilitychange', () => { if (document.hidden) flushCache(); else pump(); });
         window.addEventListener('pagehide', flushCache);
 
-        // 离开时间线进入详情页前，锁定当前焦点推文及其相对视口顶部的真实像素位置 (点击推文任何区域均可捕获)
-        document.addEventListener('click', (e) => {
-            if (isDetailPage()) return;
-            const art = e.target.closest?.('article');
-            if (art) {
-                const id = findTweetId(art);
-                if (id) {
-                    try {
-                        sessionStorage.setItem('xt_focal_id', id);
-                        sessionStorage.setItem('xt_focal_top', String(art.getBoundingClientRect().top));
-                        sessionStorage.setItem('xt_timeline_path', location.pathname);
-                    } catch (_) { /* ignore */ }
-                }
-            }
-        }, true);
-
-        // 返回时间线时：基于离开前的焦点推文进行视口物理锚定，彻底解决虚拟列表重载与卡片撑高造成的上下弹跳与漂移
+        // 返回时间线过渡期间 (500ms) 暂停后台批量接管与自动翻译，彻底根除上下弹跳
         window.addEventListener('popstate', () => {
             if (isDetailPage()) return;
-            try {
-                const focalId = sessionStorage.getItem('xt_focal_id');
-                const targetTop = parseFloat(sessionStorage.getItem('xt_focal_top') || 'NaN');
-                const savedPath = sessionStorage.getItem('xt_timeline_path');
-                if (!focalId || Number.isNaN(targetTop) || savedPath !== location.pathname) return;
-
-                let attempts = 0;
-                let userScrolled = false;
-                const cancel = () => { userScrolled = true; };
-                window.addEventListener('wheel', cancel, { once: true, passive: true });
-                window.addEventListener('touchstart', cancel, { once: true, passive: true });
-
-                const align = () => {
-                    if (userScrolled || attempts++ >= 35) {
-                        sessionStorage.removeItem('xt_focal_id');
-                        sessionStorage.removeItem('xt_focal_top');
-                        sessionStorage.removeItem('xt_timeline_path');
-                        return;
-                    }
-                    const articles = Array.from(document.querySelectorAll('article'));
-                    for (const a of articles) {
-                        if (findTweetId(a) === focalId) {
-                            const curTop = a.getBoundingClientRect().top;
-                            const diff = curTop - targetTop;
-                            if (Math.abs(diff) > 1.5) {
-                                window.scrollBy(0, diff);
-                            }
-                            break;
-                        }
-                    }
-                    requestAnimationFrame(align);
-                };
-                requestAnimationFrame(align);
-            } catch (_) { /* ignore */ }
+            navRestoring = true;
+            autoTimers.forEach((t) => clearTimeout(t));
+            autoTimers.clear();
+            queue.filter((j) => j.auto).forEach((j) => { delete j.el.dataset.xtQueued; });
+            queue = queue.filter((j) => !j.auto);
+            clearTimeout(navRestoreTimer);
+            navRestoreTimer = setTimeout(() => {
+                navRestoring = false;
+                takeoverAll();
+            }, 500);
         });
 
         new MutationObserver(onMutations).observe(document.body, { childList: true, subtree: true });
