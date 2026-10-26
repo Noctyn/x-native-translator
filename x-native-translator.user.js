@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/x-native-translator/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
-// @version      3.4.0
+// @version      3.4.1
 // @description  悬停推文即刻调用 X 官方 Grok AI 翻译，并支持可选「自动翻译」（滚动到哪译到哪）；色条引述 / 卡片 / 极简三档外观，译文·对照·原文丝滑切换，动效分「无 / 中等 / 全」三档，低配设备也流畅
 // @author       Noctyn
 // @license      MIT
@@ -23,7 +23,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '3.4.0';
+    const VERSION = '3.4.1';
     const rootEl = document.documentElement;
     // 防止同时安装多个副本导致重复挂载
     if (rootEl.hasAttribute('data-xt-loaded')) return;
@@ -2007,11 +2007,24 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
     function isNativeHeaderBar(bar) {
         return !bar.closest('.xt-box') && isBarSized(bar) && bar.querySelector('svg') && NATIVE_HEADER_RE.test(bar.textContent || '');
     }
+    // 在视口上方挂载卡片时补偿滚动距离，避免撑开高度推动下方可见内容导致页面弹跳
+    function withScrollComp(article, fn) {
+        if (!article || isDetailPage()) return fn();
+        const r = article.getBoundingClientRect();
+        const isAbove = r.bottom <= 0;
+        const h0 = isAbove ? article.offsetHeight : 0;
+        const res = fn();
+        if (isAbove) {
+            const delta = article.offsetHeight - h0;
+            if (delta !== 0) window.scrollBy(0, delta);
+        }
+        return res;
+    }
 
     function mountTakenOverBox(tweetTextEl, translatedText, srcName) {
         if (!tweetTextEl || !tweetTextEl.isConnected || tweetTextEl.dataset.xtStatus === 'translated' || boxOf(tweetTextEl)) return;
         tweetTextEl.dataset.xtStatus = 'translated';
-        if (config.autoExpand) {
+        if (config.autoExpand || isDetailPage()) {
             delete tweetTextEl.dataset.xtExpanded;
             expandIfTruncated(tweetTextEl);
         }
@@ -2106,12 +2119,12 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
                     const target = tweetTextEl.isConnected ? tweetTextEl : article.querySelectorAll(TEXT_SEL)[index];
                     if (target && !boxOf(target)) {
                         let wasTruncated = hadShowMore;
-                        if (config.autoExpand) {
+                        if (config.autoExpand || isDetailPage()) {
                             delete target.dataset.xtExpanded;
                             expandIfTruncated(target);
                             if (target.dataset.xtExpanded) wasTruncated = true;
                         }
-                        const box = mountTakenOverBox(target, translatedText, srcName);
+                        const box = withScrollComp(article, () => mountTakenOverBox(target, translatedText, srcName));
                         // 长推文原先被推特折叠截断时，官方译文只是前半截：后台补全完整译文
                         if (box && (wasTruncated || looksTruncated(translatedText))) {
                             completeTruncatedTranslation(box, target, translatedText);
@@ -2121,7 +2134,7 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
                     }
                 }, 80);
             } else {
-                const box = mountTakenOverBox(tweetTextEl, translatedText, srcName);
+                const box = withScrollComp(article, () => mountTakenOverBox(tweetTextEl, translatedText, srcName));
                 if (box && (tweetTextEl.dataset.xtExpanded || looksTruncated(translatedText))) {
                     completeTruncatedTranslation(box, tweetTextEl, translatedText);
                 }
@@ -2461,23 +2474,6 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
                 body.classList.remove('xt-clamped');
             }
         });
-    }
-
-    // 仅在地址切换时全量处理一次 (不再随每次 DOM 变动全页扫描)
-    function syncPageClamping() {
-        if (isDetailPage()) {
-            document.querySelectorAll('.xt-clamped').forEach((el) => el.classList.remove('xt-clamped'));
-            document.querySelectorAll('.xt-orig-expand-btn, .xt-trans-expand-btn').forEach((b) => b.remove());
-            document.querySelectorAll(TEXT_SEL).forEach((el) => expandMainTweet(el));
-        } else {
-            document.querySelectorAll(TEXT_SEL).forEach((el) => {
-                const box = boxOf(el);
-                if (!box) return;
-                setupOriginalClamping(el, box);
-                const body = box.querySelector('.xt-body-wrap');
-                if (body && box.dataset.view !== 'original') setupTranslationClamping(body, box);
-            });
-        }
     }
 
     function renderResult(box, el, result, retry, opts = {}) {
@@ -3565,15 +3561,6 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
      * ===================================================================== */
     const pendingNodes = new Set();
     let flushTimer = 0;
-    let lastHref = location.href;
-
-    // SPA 路由切换后做一次全量折叠处理。多重来源 (history 包装 / popstate / DOM 变更) 都可调用，兜底 pushState 被拦不到的情况
-    function checkUrl() {
-        if (location.href === lastHref) return;
-        lastHref = location.href;
-        syncPageClamping();
-    }
-
     function onMutations(mutations) {
         let any = false;
         for (const m of mutations) {
@@ -3589,7 +3576,6 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
 
     function flushMutations() {
         flushTimer = 0;
-        checkUrl();
         const nodes = Array.from(pendingNodes);
         pendingNodes.clear();
         const articles = new Set();
@@ -3661,14 +3647,38 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         // 切到后台时立刻落盘缓存 (移动端 / 标签页被冻结时 pagehide 不一定触发)；回到前台则继续队列
         document.addEventListener('visibilitychange', () => { if (document.hidden) flushCache(); else pump(); });
         window.addEventListener('pagehide', flushCache);
-        window.addEventListener('popstate', checkUrl);
-        const wrapHistory = (orig) => function (...args) {
-            const ret = orig.apply(this, args);
-            checkUrl();
-            return ret;
-        };
-        if (history.pushState) history.pushState = wrapHistory(history.pushState);
-        if (history.replaceState) history.replaceState = wrapHistory(history.replaceState);
+
+        // 记录离开时间线进入详情页前的滚动位置
+        document.addEventListener('click', (e) => {
+            const link = e.target.closest?.('a[href*="/status/"]');
+            if (link && !isDetailPage()) {
+                try {
+                    sessionStorage.setItem('xt_timeline_scrollY', String(window.scrollY));
+                    sessionStorage.setItem('xt_timeline_path', location.pathname);
+                } catch (_) { /* ignore */ }
+            }
+        }, true);
+
+        // 返回时间线时精确锁定恢复滚动位置，彻底消除页面抖动与位置偏差
+        window.addEventListener('popstate', () => {
+            if (isDetailPage()) return;
+            try {
+                const savedY = parseFloat(sessionStorage.getItem('xt_timeline_scrollY') || '-1');
+                const savedPath = sessionStorage.getItem('xt_timeline_path');
+                if (savedY >= 0 && savedPath === location.pathname) {
+                    sessionStorage.removeItem('xt_timeline_scrollY');
+                    sessionStorage.removeItem('xt_timeline_path');
+                    let frames = 0;
+                    const restoreLock = () => {
+                        if (Math.abs(window.scrollY - savedY) > 2) {
+                            window.scrollTo({ top: savedY, behavior: 'instant' });
+                        }
+                        if (++frames < 8) requestAnimationFrame(restoreLock);
+                    };
+                    requestAnimationFrame(restoreLock);
+                }
+            } catch (_) { /* ignore */ }
+        });
 
         new MutationObserver(onMutations).observe(document.body, { childList: true, subtree: true });
         listenRemoteConfig();
@@ -3676,7 +3686,6 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         if (config.autoTranslate) startAuto();
         scanBioElements();
         if (config.takeoverNative) takeoverAll();
-        syncPageClamping();
     }
 
     if (document.readyState === 'loading') {
