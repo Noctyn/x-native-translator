@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/x-native-translator/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
-// @version      3.4.1
+// @version      3.4.2
 // @description  悬停推文即刻调用 X 官方 Grok AI 翻译，并支持可选「自动翻译」（滚动到哪译到哪）；色条引述 / 卡片 / 极简三档外观，译文·对照·原文丝滑切换，动效分「无 / 中等 / 全」三档，低配设备也流畅
 // @author       Noctyn
 // @license      MIT
@@ -23,7 +23,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '3.4.1';
+    const VERSION = '3.4.2';
     const rootEl = document.documentElement;
     // 防止同时安装多个副本导致重复挂载
     if (rootEl.hasAttribute('data-xt-loaded')) return;
@@ -2072,12 +2072,16 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
 
     function takeoverNativeTranslation(article, force = false) {
         if (!config.takeoverNative || !article?.isConnected) return;
+        // 时间线页面中，若推文完全在视口上方 (bottom < -50)，不主动触发耗时接管，避免撑开高度导致滚动跳动
+        if (!isDetailPage() && !force) {
+            const r = article.getBoundingClientRect();
+            if (r.bottom < -50) return;
+        }
         const text = article.textContent || '';
         // 快速预检：整条推文里连「翻译」字样都没有，就无需深入扫描
         if (!NATIVE_HINT_RE.test(text)) { takeoverSig.set(article, text.length); return; }
         if (!force && takeoverSig.get(article) === text.length) return;
         takeoverSig.set(article, text.length);
-
         hideNativeTranslateBar(article);
 
         const bars = Array.from(article.querySelectorAll('div[dir="ltr"]')).filter(isNativeHeaderBar);
@@ -3492,10 +3496,19 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         }
     }
 
+    let scrollTakeoverTimer = 0;
     function onScroll() {
         movedSinceScroll = false;
         clearTimeout(hoverTimer);
         hoverTimer = null;
+        if (config.takeoverNative && !isDetailPage()) {
+            if (!scrollTakeoverTimer) {
+                scrollTakeoverTimer = setTimeout(() => {
+                    scrollTakeoverTimer = 0;
+                    takeoverAll();
+                }, 200);
+            }
+        }
     }
 
     function onMouseOut(e) {
@@ -3648,35 +3661,58 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         document.addEventListener('visibilitychange', () => { if (document.hidden) flushCache(); else pump(); });
         window.addEventListener('pagehide', flushCache);
 
-        // 记录离开时间线进入详情页前的滚动位置
+        // 离开时间线进入详情页前，锁定当前焦点推文及其相对视口顶部的真实像素位置 (点击推文任何区域均可捕获)
         document.addEventListener('click', (e) => {
-            const link = e.target.closest?.('a[href*="/status/"]');
-            if (link && !isDetailPage()) {
-                try {
-                    sessionStorage.setItem('xt_timeline_scrollY', String(window.scrollY));
-                    sessionStorage.setItem('xt_timeline_path', location.pathname);
-                } catch (_) { /* ignore */ }
+            if (isDetailPage()) return;
+            const art = e.target.closest?.('article');
+            if (art) {
+                const id = findTweetId(art);
+                if (id) {
+                    try {
+                        sessionStorage.setItem('xt_focal_id', id);
+                        sessionStorage.setItem('xt_focal_top', String(art.getBoundingClientRect().top));
+                        sessionStorage.setItem('xt_timeline_path', location.pathname);
+                    } catch (_) { /* ignore */ }
+                }
             }
         }, true);
 
-        // 返回时间线时精确锁定恢复滚动位置，彻底消除页面抖动与位置偏差
+        // 返回时间线时：基于离开前的焦点推文进行视口物理锚定，彻底解决虚拟列表重载与卡片撑高造成的上下弹跳与漂移
         window.addEventListener('popstate', () => {
             if (isDetailPage()) return;
             try {
-                const savedY = parseFloat(sessionStorage.getItem('xt_timeline_scrollY') || '-1');
+                const focalId = sessionStorage.getItem('xt_focal_id');
+                const targetTop = parseFloat(sessionStorage.getItem('xt_focal_top') || 'NaN');
                 const savedPath = sessionStorage.getItem('xt_timeline_path');
-                if (savedY >= 0 && savedPath === location.pathname) {
-                    sessionStorage.removeItem('xt_timeline_scrollY');
-                    sessionStorage.removeItem('xt_timeline_path');
-                    let frames = 0;
-                    const restoreLock = () => {
-                        if (Math.abs(window.scrollY - savedY) > 2) {
-                            window.scrollTo({ top: savedY, behavior: 'instant' });
+                if (!focalId || Number.isNaN(targetTop) || savedPath !== location.pathname) return;
+
+                let attempts = 0;
+                let userScrolled = false;
+                const cancel = () => { userScrolled = true; };
+                window.addEventListener('wheel', cancel, { once: true, passive: true });
+                window.addEventListener('touchstart', cancel, { once: true, passive: true });
+
+                const align = () => {
+                    if (userScrolled || attempts++ >= 35) {
+                        sessionStorage.removeItem('xt_focal_id');
+                        sessionStorage.removeItem('xt_focal_top');
+                        sessionStorage.removeItem('xt_timeline_path');
+                        return;
+                    }
+                    const articles = Array.from(document.querySelectorAll('article'));
+                    for (const a of articles) {
+                        if (findTweetId(a) === focalId) {
+                            const curTop = a.getBoundingClientRect().top;
+                            const diff = curTop - targetTop;
+                            if (Math.abs(diff) > 1.5) {
+                                window.scrollBy(0, diff);
+                            }
+                            break;
                         }
-                        if (++frames < 8) requestAnimationFrame(restoreLock);
-                    };
-                    requestAnimationFrame(restoreLock);
-                }
+                    }
+                    requestAnimationFrame(align);
+                };
+                requestAnimationFrame(align);
             } catch (_) { /* ignore */ }
         });
 
