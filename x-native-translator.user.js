@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Noctyn/x-native-translator/issues
 // @updateURL    https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
 // @downloadURL  https://raw.githubusercontent.com/Noctyn/x-native-translator/main/x-native-translator.user.js
-// @version      3.4.4
+// @version      3.4.5
 // @description  悬停推文即刻调用 X 官方 Grok AI 翻译，并支持可选「自动翻译」；默认双语对照、极简竖线、全动画，零第三方 API Key，超快极简顺滑
 // @author       Noctyn
 // @license      MIT
@@ -2494,6 +2494,26 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
     const CLAMP_HEIGHT = 220;
     const isDetailPage = () => /\/status\/\d+/.test(location.pathname);
 
+    // 检测当前推文是否带有 Twitter 官方的「显示更多」截断按钮
+    function hasNativeShowMore(el) {
+        const ctx = getTweetContext(el);
+        if (!ctx) return false;
+        const btn = scopedAll(ctx, '[data-testid="tweet-text-show-more-link"]')[0] ||
+            scopedAll(ctx, 'button, [role="button"]').find((b) => !b.closest('.xt-box') && SHOW_MORE_RE.test((b.textContent || '').trim()));
+        return !!btn;
+    }
+
+    // 判断该推文与译文是否应该完全展开 (无需折叠与展开按钮)：
+    // 1. 处于推文详情页 (isDetailPage)
+    // 2. 原推文没有官方截断按钮 (本身就未截断，或已被用户手动点开/自动展开全部呈现)
+    function shouldFullyExpand(el) {
+        if (isDetailPage()) return true;
+        if (!el) return false;
+        // 原推文没有官方「显示更多」按钮，说明原推文已经是完全展开状态，译文必须同样保持全部展开
+        if (!hasNativeShowMore(el)) return true;
+        return false;
+    }
+
     // 原文折叠：必须在原文可见 (对照 / 原文视图) 时测量，译文视图下原文是 display:none，scrollHeight 恒为 0
     function setupOriginalClamping(el, box) {
         if (!el || el.dataset.xtView === 'translation') return;
@@ -2503,8 +2523,8 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
             if (!el.isConnected || el.dataset.xtView === 'translation') return;
             el.parentElement?.querySelectorAll(':scope > .xt-orig-expand-btn').forEach((c) => c.remove());
 
-            // 详情页直接全部展开，无需折叠
-            if (isDetailPage()) {
+            // 原推文已完全展开 (无截断按钮) 或处于详情页：保持全部展开，绝不添加折叠与按钮
+            if (shouldFullyExpand(el)) {
                 el.classList.remove('xt-clamped');
                 return;
             }
@@ -2551,8 +2571,8 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
             if (!box.isConnected || box.dataset.view === 'original') return;
             box.querySelectorAll('.xt-trans-expand-btn').forEach((c) => c.remove());
 
-            // 详情页直接全部展开，无需折叠
-            if (isDetailPage()) {
+            // 原推文已完全展开 (无截断按钮) 或处于详情页：译文同样全部展开，绝不添加折叠与按钮
+            if (shouldFullyExpand(textElOfBox(box))) {
                 body.classList.remove('xt-clamped');
                 return;
             }
@@ -3779,10 +3799,30 @@ ${HOVER_SEL} .xt-tab-ind { width: 33px !important; transform: translateX(calc(va
         document.addEventListener('scroll', onScroll, { capture: true, passive: true });
         document.addEventListener('keydown', onKeyDown);
         document.addEventListener('click', onNativeClick, true);
+        // 用户点击推特原生的「显示更多」展开原推文时，联动将对应的译文卡片也全部展开，不进行折叠
+        document.addEventListener('click', (e) => {
+            const showMoreBtn = e.target.closest?.('[data-testid="tweet-text-show-more-link"]') ||
+                (e.target.matches?.('button, [role="button"]') && SHOW_MORE_RE.test((e.target.textContent || '').trim()) ? e.target : null);
+            if (showMoreBtn) {
+                const article = showMoreBtn.closest('article');
+                if (article) {
+                    setTimeout(() => {
+                        article.querySelectorAll(TEXT_SEL).forEach((t) => {
+                            t.classList.remove('xt-clamped');
+                            t.parentElement?.querySelectorAll(':scope > .xt-orig-expand-btn').forEach((b) => b.remove());
+                            const box = boxOf(t);
+                            if (box) {
+                                box.querySelector('.xt-body-wrap')?.classList.remove('xt-clamped');
+                                box.querySelectorAll('.xt-trans-expand-btn').forEach((b) => b.remove());
+                            }
+                        });
+                    }, 60);
+                }
+            }
+        }, true);
         // 切到后台时立刻落盘缓存 (移动端 / 标签页被冻结时 pagehide 不一定触发)；回到前台则继续队列
         document.addEventListener('visibilitychange', () => { if (document.hidden) flushCache(); else pump(); });
         window.addEventListener('pagehide', flushCache);
-
         // 返回时间线过渡期间 (500ms) 暂停后台批量接管与自动翻译，彻底根除上下弹跳
         window.addEventListener('popstate', () => {
             if (isDetailPage()) return;
